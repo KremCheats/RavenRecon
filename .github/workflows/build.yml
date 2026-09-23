@@ -1,0 +1,43 @@
+name: Build
+on:
+  push: { branches: [ main ] }
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: { token: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer || true
+      - name: Deps
+        run: brew install ldid xz make cmake || true
+      - name: Theos
+        run: |
+          [ -d "$HOME/theos" ] || git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          [ -n "$(ls -A "$HOME/theos/sdks" 2>/dev/null)" ] || "$HOME/theos/bin/install-sdk" || true
+      - name: Generate
+        run: python3 write_tree.py
+      - name: Commit back
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || (git commit -m "gen [skip ci]" && git push)
+      - name: Build
+        run: make clean || true; make
+      - name: Collect
+        run: |
+          mkdir -p dist
+          SRC=$(find .theos/obj -name RavenRecon.dylib | head -n1)
+          [ -n "$SRC" ] || { echo "no dylib produced"; find .theos -name "*.dylib" | head; exit 1; }
+          cp "$SRC" dist/RavenRecon.dylib
+          lipo -info dist/RavenRecon.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RavenRecon-dylib
+          path: dist/RavenRecon.dylib
+          if-no-files-found: error
