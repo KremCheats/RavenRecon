@@ -11,7 +11,7 @@
 //   Example:  @"https://webhook.site/1234abcd-5678-... "
 //   Leave as-is and the dumper will only write locally.
 // ============================================================
-static NSString* const kUploadURL = @"https://webhook.site/7ae342da-9360-4f2a-b137-097969a4b214";
+static NSString* const kUploadURL = @"";
 
 typedef void*       (*t_domain_get)();
 typedef void*       (*t_thread_attach)(void*);
