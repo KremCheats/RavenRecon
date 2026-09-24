@@ -1,310 +1,207 @@
-// ────────────────────────────────────────────────────────────────
-// RavenRecon — IL2CPP class dumper tweak.
-// Container-only output. No PHPhotoLibrary, no pasteboard.
-// Writes to <Documents>/ravenrecon/ (text + PNG pages).
-// ────────────────────────────────────────────────────────────────
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #import <dlfcn.h>
+#import <string.h>
+#import <stdio.h>
+#import <strings.h>
 #import <mach-o/dyld.h>
 
-// ════════════════════════════════════════════════════════════════
-// IL2CPP opaque types
-// ════════════════════════════════════════════════════════════════
-typedef struct Il2CppDomain   Il2CppDomain;
-typedef struct Il2CppAssembly Il2CppAssembly;
-typedef struct Il2CppImage    Il2CppImage;
-typedef struct Il2CppClass    Il2CppClass;
-typedef struct FieldInfo      FieldInfo;
-typedef struct MethodInfo     MethodInfo;
+typedef void*       (*t_domain_get)();
+typedef void*       (*t_thread_attach)(void*);
+typedef void*       (*t_assembly_get_image)(void*);
+typedef size_t      (*t_domain_get_assemblies)(void*, size_t*);
+typedef size_t      (*t_image_get_class_count)(void*);
+typedef void*       (*t_image_get_class)(void*, size_t);
+typedef const char* (*t_class_get_name)(void*);
+typedef const char* (*t_class_get_namespace)(void*);
+typedef void*       (*t_class_get_fields)(void*, void**);
+typedef const char* (*t_field_get_name)(void*);
+typedef size_t      (*t_field_get_offset)(void*);
+typedef void*       (*t_class_get_methods)(void*, void**);
+typedef const char* (*t_method_get_name)(void*);
+typedef uint32_t    (*t_method_get_param_count)(void*);
 
-// ════════════════════════════════════════════════════════════════
-// Resolved IL2CPP API
-// ════════════════════════════════════════════════════════════════
-typedef struct {
-    Il2CppDomain*   (*domain_get)(void);
-    Il2CppAssembly**(*domain_get_assemblies)(Il2CppDomain*, size_t*);
-    Il2CppImage*    (*assembly_get_image)(const Il2CppAssembly*);
-    const char*     (*image_get_name)(const Il2CppImage*);
-    size_t          (*image_get_class_count)(const Il2CppImage*);
-    Il2CppClass*    (*image_get_class)(const Il2CppImage*, size_t);
-    const char*     (*class_get_name)(Il2CppClass*);
-    const char*     (*class_get_namespace)(Il2CppClass*);
-    uint32_t        (*class_get_field_count)(Il2CppClass*);
-    FieldInfo*      (*class_get_fields)(Il2CppClass*, void**);
-    const char*     (*field_get_name)(FieldInfo*);
-    size_t          (*field_get_offset)(FieldInfo*);
-    size_t          (*class_get_method_count)(Il2CppClass*);
-    MethodInfo*     (*class_get_methods)(Il2CppClass*, void**);
-    const char*     (*method_get_name)(MethodInfo*);
-    uint32_t        (*method_get_param_count)(MethodInfo*);
-} Il2CppApi;
+static t_domain_get             p_domain_get = NULL;
+static t_thread_attach          p_thread_attach = NULL;
+static t_assembly_get_image     p_assembly_get_image = NULL;
+static t_domain_get_assemblies  p_domain_get_assemblies = NULL;
+static t_image_get_class_count  p_image_get_class_count = NULL;
+static t_image_get_class        p_image_get_class = NULL;
+static t_class_get_name         p_class_get_name = NULL;
+static t_class_get_namespace    p_class_get_namespace = NULL;
+static t_class_get_fields       p_class_get_fields = NULL;
+static t_field_get_name         p_field_get_name = NULL;
+static t_field_get_offset       p_field_get_offset = NULL;
+static t_class_get_methods      p_class_get_methods = NULL;
+static t_method_get_name        p_method_get_name = NULL;
+static t_method_get_param_count p_method_get_param_count = NULL;
 
-static Il2CppApi api = {0};
-
-// ════════════════════════════════════════════════════════════════
-// Container paths
-// ════════════════════════════════════════════════════════════════
-static NSString* raven_dump_dir(void) {
-    NSArray<NSString*>* paths =
-        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                            NSUserDomainMask, YES);
-    NSString* docs = paths.firstObject ?: NSTemporaryDirectory();
-    NSString* dir  = [docs stringByAppendingPathComponent:@"ravenrecon"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
-    return dir;
-}
-
-// ════════════════════════════════════════════════════════════════
-// IL2CPP resolution
-//   1. dlsym against the whole process
-//   2. dlopen UnityFramework by image name, dlsym against the handle
-// ════════════════════════════════════════════════════════════════
-static void* raven_resolve_handle(void) {
-    const char* names[] = {
-        "UnityFramework",
-        "UnityFramework.framework/UnityFramework",
-        NULL
-    };
-    for (int i = 0; names[i]; i++) {
-        void* h = dlopen(names[i], RTLD_NOW | RTLD_NOLOAD);
-        if (h) return h;
-    }
-    return RTLD_DEFAULT;
-}
-
-static void* raven_sym(void* handle, const char* name) {
-    void* p = dlsym(handle, name);
-    if (!p) p = dlsym(RTLD_DEFAULT, name);
-    if (!p) p = dlsym(RTLD_SELF, name);
+static void* rs(const char* n) {
+    void* p = dlsym(RTLD_DEFAULT, n);
+    if (!p) p = dlsym(RTLD_SELF, n);
     return p;
 }
 
-static BOOL raven_load_il2cpp(void) {
-    void* h = raven_resolve_handle();
+// Render the dump string into readable UIImage pages and save them to
+// the user's Photo library. This is the reliable retrieval path on
+// non-jailbroken devices where the app sandbox is not user-visible.
+static void saveDumpAsImages(NSString* dump) {
+    if (dump.length == 0) return;
 
-    #define BIND(field, sym) \
-        api.field = (void*)raven_sym(h, sym); \
-        if (!api.field) { NSLog(@"[raven] missing symbol: %s", sym); return NO; }
+    NSArray<NSString*>* lines = [dump componentsSeparatedByString:@"\n"];
+    const NSUInteger kLinesPerPage = 55;
+    NSUInteger total = lines.count;
+    NSUInteger pageCount = (total + kLinesPerPage - 1) / kLinesPerPage;
 
-    BIND(domain_get,             "il2cpp_domain_get")
-    BIND(domain_get_assemblies,  "il2cpp_domain_get_assemblies")
-    BIND(assembly_get_image,     "il2cpp_assembly_get_image")
-    BIND(image_get_name,         "il2cpp_image_get_name")
-    BIND(image_get_class_count,  "il2cpp_image_get_class_count")
-    BIND(image_get_class,        "il2cpp_image_get_class")
-    BIND(class_get_name,         "il2cpp_class_get_name")
-    BIND(class_get_namespace,    "il2cpp_class_get_namespace")
-    BIND(class_get_field_count,  "il2cpp_class_get_field_count")
-    BIND(class_get_fields,       "il2cpp_class_get_fields")
-    BIND(field_get_name,         "il2cpp_field_get_name")
-    BIND(field_get_offset,       "il2cpp_field_get_offset")
-    BIND(class_get_method_count, "il2cpp_class_get_method_count")
-    BIND(class_get_methods,      "il2cpp_class_get_methods")
-    BIND(method_get_name,        "il2cpp_method_get_name")
-    BIND(method_get_param_count, "il2cpp_method_get_param_count")
+    UIFont* mono = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    NSDictionary* attrs = @{ NSFontAttributeName: mono,
+                             NSForegroundColorAttributeName: [UIColor blackColor] };
 
-    #undef BIND
-    return YES;
+    for (NSUInteger p = 0; p < pageCount; p++) {
+        NSUInteger start = p * kLinesPerPage;
+        NSUInteger len   = MIN(kLinesPerPage, total - start);
+        NSArray* sub = [lines subarrayWithRange:NSMakeRange(start, len)];
+        NSString* pageText = [NSString stringWithFormat:@"RAVEN RECON - page %lu/%lu\n\n%@",
+                              (unsigned long)(p + 1), (unsigned long)pageCount,
+                              [sub componentsJoinedByString:@"\n"]];
+
+        CGSize maxSize = CGSizeMake(1400, 2400);
+        CGRect rect = [pageText boundingRectWithSize:maxSize
+                                             options:NSStringDrawingUsesLineFragmentOrigin
+                                          attributes:attrs
+                                             context:nil];
+        CGSize size = CGSizeMake(ceil(rect.size.width) + 24,
+                                 ceil(rect.size.height) + 24);
+
+        UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+        [[UIColor whiteColor] setFill];
+        UIRectFill(CGRectMake(0, 0, size.width, size.height));
+        [pageText drawWithRect:CGRectMake(12, 12, size.width - 24, size.height - 24)
+                       options:NSStringDrawingUsesLineFragmentOrigin
+                    attributes:attrs
+                       context:nil];
+        UIImage* img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+
+        if (img) {
+            UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
+        }
+    }
+
+    NSLog(@"[recon] wrote %lu dump page(s) to Photos", (unsigned long)pageCount);
 }
 
-// ════════════════════════════════════════════════════════════════
-// IL2CPP dump
-// ════════════════════════════════════════════════════════════════
-static NSString* raven_dump_il2cpp(void) {
-    NSMutableString* out = [NSMutableString stringWithCapacity:1 << 20];
-    [out appendString:@"// RavenRecon dump\n"];
-    [out appendString:@"// IL2CPP class layout\n\n"];
+static void dumpEverything(void) {
+    NSLog(@"[recon] dump starting");
 
-    if (!raven_load_il2cpp()) {
-        [out appendString:@"!! failed to resolve IL2CPP symbols\n"];
-        return out;
+    p_domain_get = (t_domain_get)rs("il2cpp_domain_get");
+    p_thread_attach = (t_thread_attach)rs("il2cpp_thread_attach");
+    p_assembly_get_image = (t_assembly_get_image)rs("il2cpp_assembly_get_image");
+    p_domain_get_assemblies = (t_domain_get_assemblies)rs("il2cpp_domain_get_assemblies");
+    p_image_get_class_count = (t_image_get_class_count)rs("il2cpp_image_get_class_count");
+    p_image_get_class = (t_image_get_class)rs("il2cpp_image_get_class");
+    p_class_get_name = (t_class_get_name)rs("il2cpp_class_get_name");
+    p_class_get_namespace = (t_class_get_namespace)rs("il2cpp_class_get_namespace");
+    p_class_get_fields = (t_class_get_fields)rs("il2cpp_class_get_fields");
+    p_field_get_name = (t_field_get_name)rs("il2cpp_field_get_name");
+    p_field_get_offset = (t_field_get_offset)rs("il2cpp_field_get_offset");
+    p_class_get_methods = (t_class_get_methods)rs("il2cpp_class_get_methods");
+    p_method_get_name = (t_method_get_name)rs("il2cpp_method_get_name");
+    p_method_get_param_count = (t_method_get_param_count)rs("il2cpp_method_get_param_count");
+
+    NSMutableString* out = [NSMutableString string];
+    [out appendString:@"=== RAVEN RECON DUMP v2 ===\n"];
+    [out appendFormat:@"date: %@\n", [NSDate date]];
+    [out appendFormat:@"bundle: %@\n", [[NSBundle mainBundle] bundleIdentifier]];
+
+    if (!p_domain_get || !p_domain_get_assemblies || !p_assembly_get_image) {
+        [out appendString:@"ERROR: il2cpp core API missing\n"];
+        goto writefile;
     }
 
-    Il2CppDomain* domain = api.domain_get();
-    if (!domain) {
-        [out appendString:@"!! no IL2CPP domain (is the runtime up?)\n"];
-        return out;
-    }
+    {
+        void* domain = p_domain_get();
+        if (!domain) {
+            [out appendString:@"ERROR: null domain\n"];
+            goto writefile;
+        }
 
-    size_t asmCount = 0;
-    Il2CppAssembly** assemblies = api.domain_get_assemblies(domain, &asmCount);
-    if (!assemblies) {
-        [out appendString:@"!! no assemblies\n"];
-        return out;
-    }
+        if (p_thread_attach) p_thread_attach(domain);
 
-    [out appendFormat:@"// assemblies: %zu\n\n", asmCount];
+        size_t assemblyCount = 0;
+        void** assemblies = (void**)p_domain_get_assemblies(domain, &assemblyCount);
+        [out appendFormat:@"assembly_count: %zu\n\n", assemblyCount];
 
-    for (size_t a = 0; a < asmCount; a++) {
-        @autoreleasepool {
-            Il2CppImage* image = api.assembly_get_image(assemblies[a]);
-            if (!image) continue;
+        for (size_t a = 0; a < assemblyCount; a++) {
+            void* asm_ = assemblies[a];
+            if (!asm_) continue;
+            void* img = p_assembly_get_image(asm_);
+            if (!img) continue;
 
-            const char* imgName = api.image_get_name(image);
-            [out appendFormat:@"\n// ==== %s ====\n",
-                imgName ? imgName : "<unnamed>"];
+            size_t cc = p_image_get_class_count ? p_image_get_class_count(img) : 0;
+            [out appendFormat:@"\n=========================================\n"];
+            [out appendFormat:@"ASSEMBLY %zu  (classes: %zu)\n", a, cc];
+            [out appendFormat:@"=========================================\n"];
 
-            size_t classCount = api.image_get_class_count(image);
-            for (size_t c = 0; c < classCount; c++) {
-                Il2CppClass* klass = api.image_get_class(image, c);
+            size_t dumped = 0;
+            for (size_t i = 0; i < cc; i++) {
+                void* klass = p_image_get_class(img, i);
                 if (!klass) continue;
+                const char* cname = p_class_get_name ? p_class_get_name(klass) : NULL;
+                const char* cns = p_class_get_namespace ? p_class_get_namespace(klass) : NULL;
+                if (!cname) continue;
 
-                const char* ns   = api.class_get_namespace(klass);
-                const char* name = api.class_get_name(klass);
-                if (!name) continue;
+                dumped++;
+                [out appendFormat:@"\nCLASS %s::%s\n", cns ? cns : "", cname];
 
-                NSString* fullName = (ns && ns[0])
-                    ? [NSString stringWithFormat:@"%s.%s", ns, name]
-                    : [NSString stringWithFormat:@"%s", name];
-
-                [out appendFormat:@"class %@  // size:0x%zx\n",
-                    fullName, (size_t)0];
-
-                // fields
-                void* fIter = NULL;
-                FieldInfo* field = NULL;
-                while ((field = api.class_get_fields(klass, &fIter))) {
-                    const char* fname = api.field_get_name(field);
-                    size_t off = api.field_get_offset(field);
-                    [out appendFormat:@"    [F] +0x%04zx  %s\n",
-                        off, fname ? fname : "<anon>"];
+                void* fiter = NULL;
+                while (p_class_get_fields) {
+                    void* fld = p_class_get_fields(klass, &fiter);
+                    if (!fld) break;
+                    const char* fn = p_field_get_name ? p_field_get_name(fld) : NULL;
+                    size_t off = p_field_get_offset ? p_field_get_offset(fld) : 0;
+                    [out appendFormat:@"  F %s @ 0x%lX\n", fn ? fn : "?", (unsigned long)off];
                 }
 
-                // methods
-                void* mIter = NULL;
-                MethodInfo* method = NULL;
-                while ((method = api.class_get_methods(klass, &mIter))) {
-                    const char* mname = api.method_get_name(method);
-                    uint32_t pc = api.method_get_param_count(method);
-                    [out appendFormat:@"    [M] %s(%u)\n",
-                        mname ? mname : "<anon>", pc];
+                void* miter = NULL;
+                while (p_class_get_methods) {
+                    void* m = p_class_get_methods(klass, &miter);
+                    if (!m) break;
+                    const char* mn = p_method_get_name ? p_method_get_name(m) : NULL;
+                    uint32_t pc = p_method_get_param_count ? p_method_get_param_count(m) : 0;
+                    [out appendFormat:@"  M %s (%u)\n", mn ? mn : "?", pc];
                 }
             }
+            [out appendFormat:@"\nassembly %zu dumped %zu classes.\n", a, dumped];
         }
     }
 
-    return out;
+writefile:;
+    NSString* dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString* path = [dir stringByAppendingPathComponent:@"recon_dump.txt"];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    NSLog(@"[recon] wrote %@ (%lu bytes)", path, (unsigned long)out.length);
+
+    // Clipboard copy — user can paste the whole dump into Notes.
+    [UIPasteboard generalPasteboard].string = out;
+
+    // Save readable image pages to Photos for easy sharing.
+    saveDumpAsImages(out);
 }
 
-// ════════════════════════════════════════════════════════════════
-// TCC-safe page renderer.
-// Writes PNGs to <Documents>/ravenrecon/pages/, no Photos, no TCC.
-// ════════════════════════════════════════════════════════════════
-static void raven_save_pages(NSString* dump) {
-    @autoreleasepool {
-        if (dump.length == 0) return;
-
-        NSArray<NSString*>* lines = [dump componentsSeparatedByString:@"\n"];
-        const NSUInteger kLinesPerPage = 55;
-        const NSUInteger kMaxPages     = 200;
-
-        NSUInteger totalPages = (lines.count + kLinesPerPage - 1) / kLinesPerPage;
-        NSUInteger pageCount  = MIN(totalPages, kMaxPages);
-        if (pageCount == 0) return;
-
-        NSString* pagesDir = [raven_dump_dir() stringByAppendingPathComponent:@"pages"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:pagesDir
-                                  withIntermediateDirectories:YES
-                                                   attributes:nil
-                                                        error:nil];
-
-        UIFont* font = [UIFont monospacedSystemFontOfSize:11
-                                                   weight:UIFontWeightRegular];
-        NSDictionary* attrs = @{
-            NSFontAttributeName            : font,
-            NSForegroundColorAttributeName : UIColor.blackColor
-        };
-
-        const CGSize kPageSize = CGSizeMake(1242, 2208);
-
-        for (NSUInteger p = 0; p < pageCount; p++) {
-            @autoreleasepool {
-                UIGraphicsBeginImageContextWithOptions(kPageSize, YES, 1.0);
-                [[UIColor whiteColor] setFill];
-                UIRectFill((CGRect){ .origin = CGPointZero, .size = kPageSize });
-
-                NSUInteger start = p * kLinesPerPage;
-                NSUInteger end   = MIN(start + kLinesPerPage, lines.count);
-                NSString* pageText =
-                    [[lines subarrayWithRange:NSMakeRange(start, end - start)]
-                        componentsJoinedByString:@"\n"];
-
-                [pageText drawWithRect:(CGRect){ .origin = { 12, 24 },
-                                                 .size   = kPageSize }
-                               options:NSStringDrawingUsesLineFragmentOrigin
-                            attributes:attrs
-                               context:nil];
-
-                UIImage* img = UIGraphicsGetImageFromCurrentImageContext();
-                UIGraphicsEndImageContext();
-                if (!img) continue;
-
-                NSString* outPath = [pagesDir stringByAppendingPathComponent:
-                    [NSString stringWithFormat:@"raven_%04lu.png",
-                        (unsigned long)p]];
-
-                NSData* png = UIImagePNGRepresentation(img);
-                [png writeToFile:outPath atomically:YES];
-
-                NSLog(@"[raven] page %lu/%lu -> %@",
-                      (unsigned long)p, (unsigned long)pageCount, outPath);
-            }
-        }
-
-        NSLog(@"[raven] wrote %lu pages to %@",
-              (unsigned long)pageCount, pagesDir);
-    }
-}
-
-// ════════════════════════════════════════════════════════════════
-// Full recon pass
-// ════════════════════════════════════════════════════════════════
-static void raven_dump_everything(void) {
-    @autoreleasepool {
-        NSLog(@"[raven] recon starting");
-
-        NSString* dump = raven_dump_il2cpp();
-
-        NSString* txtPath = [raven_dump_dir()
-            stringByAppendingPathComponent:@"recon_dump.txt"];
-        [dump writeToFile:txtPath
-               atomically:YES
-                 encoding:NSUTF8StringEncoding
-                    error:nil];
-        NSLog(@"[raven] text dump -> %@ (%lu bytes)",
-              txtPath, (unsigned long)[dump lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
-
-        raven_save_pages(dump);
-
-        NSLog(@"[raven] recon complete");
-    }
-}
-
-// ════════════════════════════════════════════════════════════════
-// Entry — fires on load, schedules three passes.
-// ════════════════════════════════════════════════════════════════
 __attribute__((constructor))
 static void recon_entry(void) {
-    NSLog(@"[raven] loaded, scheduling recon passes");
+    @autoreleasepool {
+        NSLog(@"[recon] loaded into %@", [[NSBundle mainBundle] bundleIdentifier]);
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)( 8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            raven_dump_everything();
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            raven_dump_everything();
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(90 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            raven_dump_everything();
-        });
-    });
+        NSArray* delays = @[@8, @45, @90];
+        for (NSNumber* d in delays) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)([d doubleValue] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                dumpEverything();
+            });
+        }
+    }
 }
