@@ -1,0 +1,7 @@
+.theos/
+packages/
+dist/
+*.deb
+*.dylib
+.DS_Store
+write_tree.py
