@@ -1,43 +1,86 @@
-name: Build
+name: Build RavenRecon
+
 on:
-  push: { branches: [ main ] }
+  push:
+    branches: [ main, master ]
+  pull_request:
   workflow_dispatch:
-permissions:
-  contents: write
+
 jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-        with: { token: "${{ secrets.GITHUB_TOKEN }}" }
-      - name: Xcode
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer || true
-      - name: Deps
-        run: brew install ldid xz make cmake || true
-      - name: Theos
-        run: |
-          [ -d "$HOME/theos" ] || git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
-          [ -n "$(ls -A "$HOME/theos/sdks" 2>/dev/null)" ] || "$HOME/theos/bin/install-sdk" || true
-      - name: Generate
-        run: python3 write_tree.py
-      - name: Commit back
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || (git commit -m "gen [skip ci]" && git push)
-      - name: Build
-        run: make clean || true; make
-      - name: Collect
-        run: |
-          mkdir -p dist
-          SRC=$(find .theos/obj -name RavenRecon.dylib | head -n1)
-          [ -n "$SRC" ] || { echo "no dylib produced"; find .theos -name "*.dylib" | head; exit 1; }
-          cp "$SRC" dist/RavenRecon.dylib
-          lipo -info dist/RavenRecon.dylib
-      - uses: actions/upload-artifact@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          name: RavenRecon-dylib
-          path: dist/RavenRecon.dylib
+          submodules: recursive
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/theos
+          key: ${{ runner.os }}-theos-v1
+
+      - name: Setup Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          export THEOS=${{ github.workspace }}/theos
+          git clone --recursive --depth=1 https://github.com/theos/theos.git $THEOS
+          mkdir -p $THEOS/sdks
+          curl -L https://github.com/theos/sdks/archive/master.zip -o /tmp/sdks.zip
+          unzip -q /tmp/sdks.zip -d /tmp/sdks
+          mv /tmp/sdks/sdks-master/*.sdk $THEOS/sdks/
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build
+        run: |
+          export THEOS=${{ github.workspace }}/theos
+          export PATH=$THEOS/bin:$PATH
+          make clean
+          make package FINALPACKAGE=1
+
+      - name: Locate artifacts
+        id: locate
+        run: |
+          echo "deb=$(ls packages/*.deb | head -n1)" >> $GITHUB_OUTPUT
+          DYLIB=$(find .theos -name 'RavenRecon.dylib' -type f | head -n1)
+          echo "dylib=$DYLIB" >> $GITHUB_OUTPUT
+          echo "--- dylib info ---"
+          lipo -info "$DYLIB" || true
+          otool -l "$DYLIB" | grep -A1 LC_UUID || true
+          echo "--- verifying patch ---"
+          if strings "$DYLIB" | grep -q UIImageWriteToSavedPhotosAlbum; then
+            echo "!! OLD CODE STILL PRESENT"
+            echo "patch_missing=true" >> $GITHUB_OUTPUT
+          else
+            echo "OK — Photos path removed"
+            echo "patch_missing=false" >> $GITHUB_OUTPUT
+          fi
+          if strings "$DYLIB" | grep -q raven_save_pages || strings "$DYLIB" | grep -q saveDumpAsImages; then
+            echo "OK — container renderer present"
+          else
+            echo "!! container renderer not found in binary"
+          fi
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ravenrecon-deb
+          path: packages/*.deb
           if-no-files-found: error
+
+      - name: Upload raw .dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: ravenrecon-dylib
+          path: ${{ steps.locate.outputs.dylib }}
+          if-no-files-found: error
+
+      - name: Fail if old code still in binary
+        if: steps.locate.outputs.patch_missing == 'true'
+        run: |
+          echo "Binary still contains UIImageWriteToSavedPhotosAlbum — Tweak.mm wasn't updated."
+          exit 1
