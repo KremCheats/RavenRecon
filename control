@@ -1,8 +1,8 @@
 Package: com.mahi.ravenrecon
 Name: RavenRecon
-Version: 1.0.0
-Architecture: iphoneos-arm
-Description: One-shot IL2CPP class dumper for Combat Master
+Version: 1.1.0
+Architecture: iphoneos-arm64
+Description: IL2CPP class dumper — container-only output
 Maintainer: mahi
 Author: mahi
 Section: Tweaks
