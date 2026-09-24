@@ -1,9 +1,8 @@
-name: Build RavenRecon
+name: Build Raven
 
 on:
   push:
     branches: [ main, master ]
-  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -12,8 +11,67 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      - name: Create filter plist
+        run: |
+          cat > Raven.plist <<'EOF'
+          { Filter = { Bundles = ( "com.AlfaBravo.CombatMaster" ); }; }
+          EOF
+
+      - name: Patch dumper to filter output
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+
+          TARGET = "write_tree.py"
+          try:
+              src = open(TARGET).read()
+          except FileNotFoundError:
+              print("[error] write_tree.py not found"); sys.exit(1)
+
+          # 1. add <cstring> include so strstr works
+          if "#include <cstring>" not in src:
+              src = src.replace(
+                  "#import <dlfcn.h>\n#import <objc/runtime.h>",
+                  "#import <dlfcn.h>\n#import <objc/runtime.h>\n#include <cstring>"
+              )
+              print("[fix] added <cstring>")
+
+          # 2. insert the filter inside dumpEverything's class loop
+          anchor = '''    if (!cname) continue;
+              dumped++;'''
+          filt = '''    if (!cname) continue;
+              {
+                  const char* ns = cns ? cns : "";
+                  bool keep = false;
+                  const char* pats[] = {
+                      "PlayerRoot","PlayerHealth","PlayerMovement",
+                      "PlayerMobView","MobView","CameraController",
+                      "ActiveMobView","LocalPlayer","MyPlayer","AllPlayers",
+                      "PlayerManager","BattlePlayer","MapPlayer",
+                      "PlayerState","PlayerCommand","PlayerMetadata",
+                      NULL
+                  };
+                  for (int k = 0; pats[k]; k++) {
+                      if (strstr(cname, pats[k]) || strstr(ns, pats[k])) { keep = true; break; }
+                  }
+                  if (!keep) continue;
+              }
+              dumped++;'''
+
+          if anchor in src:
+              src = src.replace(anchor, filt)
+              print("[fix] filter injected")
+          elif "strstr(cname, \"PlayerRoot\")" in src:
+              print("[skip] filter already present")
+          else:
+              print("[warn] anchor not found — dump will stay unfiltered")
+
+          open(TARGET, "w").write(src)
+          PYEOF
+
+      - name: Regenerate
+        run: python3 write_tree.py
 
       - name: Cache Theos
         id: cache-theos
@@ -40,47 +98,18 @@ jobs:
           export THEOS=${{ github.workspace }}/theos
           export PATH=$THEOS/bin:$PATH
           make clean
-          make package FINALPACKAGE=1
+          make
 
-      - name: Locate artifacts
-        id: locate
+      - name: Verify
         run: |
-          echo "deb=$(ls packages/*.deb | head -n1)" >> $GITHUB_OUTPUT
-          DYLIB=$(find .theos -name 'RavenRecon.dylib' -type f | head -n1)
-          echo "dylib=$DYLIB" >> $GITHUB_OUTPUT
-          echo "--- dylib info ---"
-          lipo -info "$DYLIB" || true
-          otool -l "$DYLIB" | grep -A1 LC_UUID || true
-          echo "--- verifying patch ---"
-          if strings "$DYLIB" | grep -q UIImageWriteToSavedPhotosAlbum; then
-            echo "!! OLD CODE STILL PRESENT"
-            echo "patch_missing=true" >> $GITHUB_OUTPUT
-          else
-            echo "OK — Photos path removed"
-            echo "patch_missing=false" >> $GITHUB_OUTPUT
-          fi
-          if strings "$DYLIB" | grep -q raven_save_pages || strings "$DYLIB" | grep -q saveDumpAsImages; then
-            echo "OK — container renderer present"
-          else
-            echo "!! container renderer not found in binary"
-          fi
+          DYLIB=$(find .theos -name 'Raven.dylib' -type f | head -n1)
+          echo "dylib: $DYLIB"
+          ls -la "$DYLIB"
+          strings "$DYLIB" | grep -q "PlayerRoot" && echo "OK: filter strings present" || { echo "FAIL"; exit 1; }
 
-      - name: Upload .deb
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: ravenrecon-deb
-          path: packages/*.deb
+          name: raven-dylib
+          path: ${{ github.workspace }}/.theos/obj/debug/Raven.dylib
           if-no-files-found: error
-
-      - name: Upload raw .dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: ravenrecon-dylib
-          path: ${{ steps.locate.outputs.dylib }}
-          if-no-files-found: error
-
-      - name: Fail if old code still in binary
-        if: steps.locate.outputs.patch_missing == 'true'
-        run: |
-          echo "Binary still contains UIImageWriteToSavedPhotosAlbum — Tweak.mm wasn't updated."
-          exit 1
