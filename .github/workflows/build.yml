@@ -15,12 +15,6 @@ jobs:
       - name: Regenerate
         run: python3 write_tree.py
 
-      - name: Create filter plist
-        run: |
-          cat > RavenRecon.plist <<'EOF'
-          { Filter = { Bundles = ( "com.AlfaBravo.CombatMaster" ); }; }
-          EOF
-
       - name: Cache Theos
         id: cache-theos
         uses: actions/cache@v4
@@ -69,16 +63,22 @@ jobs:
             echo "FAIL: v3 magic missing"
             exit 1
           fi
-          if strings "$DYLIB" | grep -q "Assembly-CSharp"; then
-            echo "OK: assembly filter present"
+          if strings "$DYLIB" | grep -q "il2cpp_image_get_class"; then
+            echo "OK: il2cpp API strings present"
           else
-            echo "FAIL: assembly filter missing"
+            echo "FAIL: il2cpp API strings missing"
             exit 1
           fi
           if strings "$DYLIB" | grep -q "recon_dump.txt"; then
             echo "OK: output filename present"
           else
             echo "FAIL: output filename missing"
+            exit 1
+          fi
+          if strings "$DYLIB" | grep -q "recon_alive.txt"; then
+            echo "OK: heartbeat filename present"
+          else
+            echo "FAIL: heartbeat filename missing"
             exit 1
           fi
 
