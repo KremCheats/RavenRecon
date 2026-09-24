@@ -166,7 +166,7 @@ static int ra_resolve_symbols(void) {
 }
 
 static BOOL ra_string_matches_any(NSString* s, NSArray* patterns) {
-    if (!patterns) return YES;             // nil = match all
+    if (!patterns) return YES;
     if (!s) return NO;
     for (NSString* p in patterns) if ([s isEqualToString:p]) return YES;
     return NO;
@@ -219,7 +219,6 @@ static void ra_dump(void) {
     }
 
     size_t asmScanned = 0;
-    size_t asmMatched = 0;
     size_t totalClasses = 0;
     size_t totalMatched = 0;
 
@@ -234,7 +233,6 @@ static void ra_dump(void) {
         asmScanned++;
         NSString* asmName = [NSString stringWithUTF8String:an];
 
-        // nil assembly filter → accept every assembly
         if (kTargetAssemblies && !ra_string_matches_any(asmName, kTargetAssemblies)) continue;
 
         size_t classCount = p_image_get_class_count(img);
@@ -324,7 +322,6 @@ static void ra_dump(void) {
         }
 
         if (matchedInAsm > 0) {
-            asmMatched++;
             [out appendFormat:@"=========================================\n"];
             [out appendFormat:@"ASSEMBLY: %@ (classes: %zu, matched: %zu)\n",
              asmName, classCount, matchedInAsm];
@@ -392,7 +389,6 @@ static void ra_entry(void) {
 
         ra_log_stage(@"entry: constructor fired");
 
-        // scan every assembly
         kTargetAssemblies = nil;
 
         kTargetClasses = @[
@@ -437,7 +433,7 @@ w("RavenRecon.plist", r"""
 w("control", r"""
 Package: com.mahi.ravenrecon
 Name: RavenRecon
-Version: 1.1.4
+Version: 1.1.5
 Architecture: iphoneos-arm64
 Description: IL2CPP class dumper — container-only output
 Maintainer: mahi
@@ -447,4 +443,4 @@ Depends: firmware (>= 14.0)
 """)
 
 
-print("done - RavenRecon v3.3 — no assembly filter")
+print("done - RavenRecon v3.3 sources generated")
