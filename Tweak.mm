@@ -1,39 +1,40 @@
-// RavenRecon — IL2CPP class dumper.
-// Container-only output. No PHPhotoLibrary, no pasteboard.
-
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <objc/runtime.h>
+#import <dispatch/dispatch.h>
 #import <dlfcn.h>
+#import <string.h>
+#import <stdio.h>
+#import <strings.h>
+#import <mach-o/dyld.h>
 
-typedef void* (*t_domain_get)();
-typedef void* (*t_thread_attach)(void*);
-typedef void* (*t_assembly_get_image)(void*);
-typedef size_t (*t_domain_get_assemblies)(void*, size_t*);
-typedef size_t (*t_image_get_class_count)(void*);
-typedef void* (*t_image_get_class)(void*, size_t);
+typedef void*       (*t_domain_get)();
+typedef void*       (*t_thread_attach)(void*);
+typedef void*       (*t_assembly_get_image)(void*);
+typedef size_t      (*t_domain_get_assemblies)(void*, size_t*);
+typedef size_t      (*t_image_get_class_count)(void*);
+typedef void*       (*t_image_get_class)(void*, size_t);
 typedef const char* (*t_class_get_name)(void*);
 typedef const char* (*t_class_get_namespace)(void*);
-typedef void* (*t_class_get_fields)(void*, void**);
+typedef void*       (*t_class_get_fields)(void*, void**);
 typedef const char* (*t_field_get_name)(void*);
-typedef size_t (*t_field_get_offset)(void*);
-typedef void* (*t_class_get_methods)(void*, void**);
+typedef size_t      (*t_field_get_offset)(void*);
+typedef void*       (*t_class_get_methods)(void*, void**);
 typedef const char* (*t_method_get_name)(void*);
-typedef uint32_t (*t_method_get_param_count)(void*);
+typedef uint32_t    (*t_method_get_param_count)(void*);
 
-static t_domain_get p_domain_get = NULL;
-static t_thread_attach p_thread_attach = NULL;
-static t_assembly_get_image p_assembly_get_image = NULL;
-static t_domain_get_assemblies p_domain_get_assemblies = NULL;
-static t_image_get_class_count p_image_get_class_count = NULL;
-static t_image_get_class p_image_get_class = NULL;
-static t_class_get_name p_class_get_name = NULL;
-static t_class_get_namespace p_class_get_namespace = NULL;
-static t_class_get_fields p_class_get_fields = NULL;
-static t_field_get_name p_field_get_name = NULL;
-static t_field_get_offset p_field_get_offset = NULL;
-static t_class_get_methods p_class_get_methods = NULL;
-static t_method_get_name p_method_get_name = NULL;
+static t_domain_get             p_domain_get = NULL;
+static t_thread_attach          p_thread_attach = NULL;
+static t_assembly_get_image     p_assembly_get_image = NULL;
+static t_domain_get_assemblies  p_domain_get_assemblies = NULL;
+static t_image_get_class_count  p_image_get_class_count = NULL;
+static t_image_get_class        p_image_get_class = NULL;
+static t_class_get_name         p_class_get_name = NULL;
+static t_class_get_namespace    p_class_get_namespace = NULL;
+static t_class_get_fields       p_class_get_fields = NULL;
+static t_field_get_name         p_field_get_name = NULL;
+static t_field_get_offset       p_field_get_offset = NULL;
+static t_class_get_methods      p_class_get_methods = NULL;
+static t_method_get_name        p_method_get_name = NULL;
 static t_method_get_param_count p_method_get_param_count = NULL;
 
 static void* rs(const char* n) {
@@ -42,89 +43,53 @@ static void* rs(const char* n) {
     return p;
 }
 
-// Container dump directory: <Documents>/ravenrecon/
-static NSString* raven_dump_dir(void) {
-    NSArray* paths = NSSearchPathForDirectoriesInDomains(
-        NSDocumentDirectory, NSUserDomainMask, YES);
-    NSString* docs = paths.firstObject ?: NSTemporaryDirectory();
-    NSString* dir = [docs stringByAppendingPathComponent:@"ravenrecon"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
-    return dir;
-}
-
-// Render the dump string into PNG pages, write to the app container.
-// No Photos, no TCC.
+// Render the dump string into readable UIImage pages and save them to
+// the user's Photo library. This is the reliable retrieval path on
+// non-jailbroken devices where the app sandbox is not user-visible.
 static void saveDumpAsImages(NSString* dump) {
     if (dump.length == 0) return;
 
-    NSArray* lines = [dump componentsSeparatedByString:@"\n"];
+    NSArray<NSString*>* lines = [dump componentsSeparatedByString:@"\n"];
     const NSUInteger kLinesPerPage = 55;
-    const NSUInteger kMaxPages = 200;
-
     NSUInteger total = lines.count;
-    NSUInteger totalPages = (total + kLinesPerPage - 1) / kLinesPerPage;
-    NSUInteger pageCount = MIN(totalPages, kMaxPages);
-    if (pageCount == 0) return;
+    NSUInteger pageCount = (total + kLinesPerPage - 1) / kLinesPerPage;
 
-    NSString* pagesDir = [raven_dump_dir() stringByAppendingPathComponent:@"pages"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:pagesDir
-                              withIntermediateDirectories:YES
-                                               attributes:nil
-                                                    error:nil];
-
-    UIFont* mono = [UIFont monospacedSystemFontOfSize:9
-                                               weight:UIFontWeightRegular];
-    NSDictionary* attrs = @{
-        NSFontAttributeName: mono,
-        NSForegroundColorAttributeName: [UIColor blackColor]
-    };
+    UIFont* mono = [UIFont monospacedSystemFontOfSize:9 weight:UIFontWeightRegular];
+    NSDictionary* attrs = @{ NSFontAttributeName: mono,
+                             NSForegroundColorAttributeName: [UIColor blackColor] };
 
     for (NSUInteger p = 0; p < pageCount; p++) {
-        @autoreleasepool {
-            NSUInteger start = p * kLinesPerPage;
-            NSUInteger len = MIN(kLinesPerPage, total - start);
-            NSArray* sub = [lines subarrayWithRange:NSMakeRange(start, len)];
-            NSString* pageText = [NSString stringWithFormat:
-                @"RAVEN RECON - page %lu/%lu\n\n%@",
-                (unsigned long)(p + 1), (unsigned long)pageCount,
-                [sub componentsJoinedByString:@"\n"]];
+        NSUInteger start = p * kLinesPerPage;
+        NSUInteger len   = MIN(kLinesPerPage, total - start);
+        NSArray* sub = [lines subarrayWithRange:NSMakeRange(start, len)];
+        NSString* pageText = [NSString stringWithFormat:@"RAVEN RECON - page %lu/%lu\n\n%@",
+                              (unsigned long)(p + 1), (unsigned long)pageCount,
+                              [sub componentsJoinedByString:@"\n"]];
 
-            CGSize maxSize = CGSizeMake(1400, 2400);
-            CGRect rect = [pageText boundingRectWithSize:maxSize
-                                                 options:NSStringDrawingUsesLineFragmentOrigin
-                                              attributes:attrs
-                                                 context:nil];
-            CGSize size = CGSizeMake(ceil(rect.size.width) + 24,
-                                     ceil(rect.size.height) + 24);
+        CGSize maxSize = CGSizeMake(1400, 2400);
+        CGRect rect = [pageText boundingRectWithSize:maxSize
+                                             options:NSStringDrawingUsesLineFragmentOrigin
+                                          attributes:attrs
+                                             context:nil];
+        CGSize size = CGSizeMake(ceil(rect.size.width) + 24,
+                                 ceil(rect.size.height) + 24);
 
-            UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
-            [[UIColor whiteColor] setFill];
-            UIRectFill(CGRectMake(0, 0, size.width, size.height));
-            [pageText drawWithRect:CGRectMake(12, 12, size.width - 24,
-                                              size.height - 24)
-                           options:NSStringDrawingUsesLineFragmentOrigin
-                        attributes:attrs
-                           context:nil];
-            UIImage* img = UIGraphicsGetImageFromCurrentImageContext();
-            UIGraphicsEndImageContext();
+        UIGraphicsBeginImageContextWithOptions(size, YES, 1.0);
+        [[UIColor whiteColor] setFill];
+        UIRectFill(CGRectMake(0, 0, size.width, size.height));
+        [pageText drawWithRect:CGRectMake(12, 12, size.width - 24, size.height - 24)
+                       options:NSStringDrawingUsesLineFragmentOrigin
+                    attributes:attrs
+                       context:nil];
+        UIImage* img = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
 
-            if (!img) continue;
-
-            NSString* outPath = [pagesDir stringByAppendingPathComponent:
-                [NSString stringWithFormat:@"raven_%04lu.png", (unsigned long)p]];
-            NSData* png = UIImagePNGRepresentation(img);
-            [png writeToFile:outPath atomically:YES];
-
-            NSLog(@"[recon] page %lu/%lu -> %@",
-                  (unsigned long)(p + 1), (unsigned long)pageCount, outPath);
+        if (img) {
+            UIImageWriteToSavedPhotosAlbum(img, nil, nil, nil);
         }
     }
 
-    NSLog(@"[recon] wrote %lu page(s) to %@",
-          (unsigned long)pageCount, pagesDir);
+    NSLog(@"[recon] wrote %lu dump page(s) to Photos", (unsigned long)pageCount);
 }
 
 static void dumpEverything(void) {
@@ -161,6 +126,7 @@ static void dumpEverything(void) {
             [out appendString:@"ERROR: null domain\n"];
             goto writefile;
         }
+
         if (p_thread_attach) p_thread_attach(domain);
 
         size_t assemblyCount = 0;
@@ -172,10 +138,10 @@ static void dumpEverything(void) {
             if (!asm_) continue;
             void* img = p_assembly_get_image(asm_);
             if (!img) continue;
-            size_t cc = p_image_get_class_count ? p_image_get_class_count(img) : 0;
 
+            size_t cc = p_image_get_class_count ? p_image_get_class_count(img) : 0;
             [out appendFormat:@"\n=========================================\n"];
-            [out appendFormat:@"ASSEMBLY %zu (classes: %zu)\n", a, cc];
+            [out appendFormat:@"ASSEMBLY %zu  (classes: %zu)\n", a, cc];
             [out appendFormat:@"=========================================\n"];
 
             size_t dumped = 0;
@@ -185,6 +151,7 @@ static void dumpEverything(void) {
                 const char* cname = p_class_get_name ? p_class_get_name(klass) : NULL;
                 const char* cns = p_class_get_namespace ? p_class_get_namespace(klass) : NULL;
                 if (!cname) continue;
+
                 dumped++;
                 [out appendFormat:@"\nCLASS %s::%s\n", cns ? cns : "", cname];
 
@@ -194,8 +161,7 @@ static void dumpEverything(void) {
                     if (!fld) break;
                     const char* fn = p_field_get_name ? p_field_get_name(fld) : NULL;
                     size_t off = p_field_get_offset ? p_field_get_offset(fld) : 0;
-                    [out appendFormat:@"    F %s @ 0x%lX\n",
-                        fn ? fn : "?", (unsigned long)off];
+                    [out appendFormat:@"  F %s @ 0x%lX\n", fn ? fn : "?", (unsigned long)off];
                 }
 
                 void* miter = NULL;
@@ -203,9 +169,8 @@ static void dumpEverything(void) {
                     void* m = p_class_get_methods(klass, &miter);
                     if (!m) break;
                     const char* mn = p_method_get_name ? p_method_get_name(m) : NULL;
-                    uint32_t pc = p_method_get_param_count
-                        ? p_method_get_param_count(m) : 0;
-                    [out appendFormat:@"    M %s (%u)\n", mn ? mn : "?", pc];
+                    uint32_t pc = p_method_get_param_count ? p_method_get_param_count(m) : 0;
+                    [out appendFormat:@"  M %s (%u)\n", mn ? mn : "?", pc];
                 }
             }
             [out appendFormat:@"\nassembly %zu dumped %zu classes.\n", a, dumped];
@@ -213,16 +178,15 @@ static void dumpEverything(void) {
     }
 
 writefile:;
-    NSString* dir = raven_dump_dir();
+    NSString* dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString* path = [dir stringByAppendingPathComponent:@"recon_dump.txt"];
-    [out writeToFile:path
-          atomically:YES
-            encoding:NSUTF8StringEncoding
-               error:nil];
+    [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSLog(@"[recon] wrote %@ (%lu bytes)", path, (unsigned long)out.length);
 
-    // PNG pages — container only. No pasteboard write (TCC-protected
-    // on iOS 16+), no Photos save.
+    // Clipboard copy — user can paste the whole dump into Notes.
+    [UIPasteboard generalPasteboard].string = out;
+
+    // Save readable image pages to Photos for easy sharing.
     saveDumpAsImages(out);
 }
 
@@ -230,6 +194,7 @@ __attribute__((constructor))
 static void recon_entry(void) {
     @autoreleasepool {
         NSLog(@"[recon] loaded into %@", [[NSBundle mainBundle] bundleIdentifier]);
+
         NSArray* delays = @[@8, @45, @90];
         for (NSNumber* d in delays) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
