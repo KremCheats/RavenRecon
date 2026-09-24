@@ -81,7 +81,6 @@ typedef struct Il2CppField    Il2CppField;
 typedef struct Il2CppMethod   Il2CppMethod;
 typedef struct Il2CppType     Il2CppType;
 
-// --- core (v2-compatible) ---
 static void*              (*p_domain_get)(void)                                     = NULL;
 static const Il2CppAssembly** (*p_domain_get_assemblies)(const Il2CppDomain*, size_t*) = NULL;
 static const Il2CppImage* (*p_assembly_get_image)(const Il2CppAssembly*)           = NULL;
@@ -129,7 +128,7 @@ static inline uintptr_t ra_strip_pac(void* p) {
 
 #define RZ(handle, sym, var) do { \
     var = (__typeof__(var))dlsym(handle, sym); \
-    if (!var) missing = [missing stringByAppendingFormat:@"%s ", sym]; \
+    if (!var) [missing appendFormat:@"%s ", sym]; \
 } while (0)
 
 static int ra_resolve_symbols(void) {
@@ -153,7 +152,7 @@ static int ra_resolve_symbols(void) {
     RZ(h, "il2cpp_type_get_name",           p_type_get_name);
     RZ(h, "il2cpp_method_get_name",         p_method_get_name);
     RZ(h, "il2cpp_method_get_param_count",  p_method_get_param_count);
-    // optional, don't add to missing if absent
+    // optional
     p_method_get_pointer = (__typeof__(p_method_get_pointer))
         dlsym(h, "il2cpp_method_get_method_pointer");
 
@@ -435,7 +434,7 @@ w("RavenRecon.plist", r"""
 w("control", r"""
 Package: com.mahi.ravenrecon
 Name: RavenRecon
-Version: 1.1.2
+Version: 1.1.3
 Architecture: iphoneos-arm64
 Description: IL2CPP class dumper — container-only output
 Maintainer: mahi
@@ -445,4 +444,4 @@ Depends: firmware (>= 14.0)
 """)
 
 
-print("done - RavenRecon v3.2 sources generated")
+print("done - RavenRecon v3.2 sources generated (RZ macro fixed)")
