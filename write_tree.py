@@ -2,7 +2,6 @@
 """
 RavenRecon — single-source generator.
 Edits go here, never in the generated files.
-Run: python3 write_tree.py
 """
 
 import os
@@ -16,12 +15,9 @@ def w(path, content):
         f.write(content.lstrip("\n"))
 
 
-# ════════════════════════════════════════════════════════════════
-# Tweak.mm — v3.1 filtered IL2CPP dumper with heartbeat
-# ════════════════════════════════════════════════════════════════
 w("Tweak.mm", r"""
-// RavenRecon v3.1 — filtered IL2CPP runtime dumper for non-JB iOS
-// adds heartbeat file so we can confirm the dylib loaded.
+// RavenRecon v3.2 — filtered dumper, singular class API (v2-compatible),
+// symbol-resolution logging.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -33,12 +29,9 @@ w("Tweak.mm", r"""
 #include <ptrauth.h>
 #endif
 
-// ============================================================
-// config
-// ============================================================
-static NSString* const kOutName  = @"recon_dump.txt";
+static NSString* const kOutName   = @"recon_dump.txt";
 static NSString* const kHeartbeat = @"recon_alive.txt";
-static NSString* const kMagic    = @"=== RAVEN RECON DUMP v3.1 ===";
+static NSString* const kMagic     = @"=== RAVEN RECON DUMP v3.2 ===";
 
 static NSArray* kTargetAssemblies = nil;
 static NSArray* kTargetClasses = nil;
@@ -46,9 +39,6 @@ static NSArray* kTargetClasses = nil;
 static const NSTimeInterval kPollInterval = 2.0;
 static const NSTimeInterval kPollTimeout  = 300.0;
 
-// ============================================================
-// helper: write a small text file to Documents
-// ============================================================
 static NSString* ra_docs_dir(void) {
     NSString* d = [NSSearchPathForDirectoriesInDomains(
         NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
@@ -81,7 +71,7 @@ static void ra_log_stage(NSString* stage) {
 }
 
 // ============================================================
-// il2cpp opaque types
+// il2cpp types
 // ============================================================
 typedef struct Il2CppDomain   Il2CppDomain;
 typedef struct Il2CppAssembly Il2CppAssembly;
@@ -91,11 +81,13 @@ typedef struct Il2CppField    Il2CppField;
 typedef struct Il2CppMethod   Il2CppMethod;
 typedef struct Il2CppType     Il2CppType;
 
+// --- core (v2-compatible) ---
 static void*              (*p_domain_get)(void)                                     = NULL;
 static const Il2CppAssembly** (*p_domain_get_assemblies)(const Il2CppDomain*, size_t*) = NULL;
 static const Il2CppImage* (*p_assembly_get_image)(const Il2CppAssembly*)           = NULL;
 static const char*        (*p_image_get_name)(const Il2CppImage*)                   = NULL;
-static const Il2CppClass**(*p_image_get_classes)(const Il2CppImage*, size_t*)      = NULL;
+static size_t             (*p_image_get_class_count)(const Il2CppImage*)            = NULL;
+static const Il2CppClass* (*p_image_get_class)(const Il2CppImage*, size_t)          = NULL;
 static const char*        (*p_class_get_name)(const Il2CppClass*)                   = NULL;
 static const char*        (*p_class_get_namespace)(const Il2CppClass*)              = NULL;
 static const Il2CppClass* (*p_class_get_parent)(const Il2CppClass*)                 = NULL;
@@ -137,16 +129,19 @@ static inline uintptr_t ra_strip_pac(void* p) {
 
 #define RZ(handle, sym, var) do { \
     var = (__typeof__(var))dlsym(handle, sym); \
+    if (!var) missing = [missing stringByAppendingFormat:@"%s ", sym]; \
 } while (0)
 
 static int ra_resolve_symbols(void) {
     void* h = RTLD_DEFAULT;
+    NSMutableString* missing = [NSMutableString string];
 
     RZ(h, "il2cpp_domain_get",              p_domain_get);
     RZ(h, "il2cpp_domain_get_assemblies",   p_domain_get_assemblies);
     RZ(h, "il2cpp_assembly_get_image",      p_assembly_get_image);
     RZ(h, "il2cpp_image_get_name",          p_image_get_name);
-    RZ(h, "il2cpp_image_get_classes",       p_image_get_classes);
+    RZ(h, "il2cpp_image_get_class_count",   p_image_get_class_count);
+    RZ(h, "il2cpp_image_get_class",         p_image_get_class);
     RZ(h, "il2cpp_class_get_name",          p_class_get_name);
     RZ(h, "il2cpp_class_get_namespace",     p_class_get_namespace);
     RZ(h, "il2cpp_class_get_parent",        p_class_get_parent);
@@ -158,27 +153,32 @@ static int ra_resolve_symbols(void) {
     RZ(h, "il2cpp_type_get_name",           p_type_get_name);
     RZ(h, "il2cpp_method_get_name",         p_method_get_name);
     RZ(h, "il2cpp_method_get_param_count",  p_method_get_param_count);
-    RZ(h, "il2cpp_method_get_method_pointer", p_method_get_pointer);
+    // optional, don't add to missing if absent
+    p_method_get_pointer = (__typeof__(p_method_get_pointer))
+        dlsym(h, "il2cpp_method_get_method_pointer");
 
-    return (p_domain_get && p_domain_get_assemblies && p_assembly_get_image &&
-            p_image_get_name && p_image_get_classes && p_class_get_name &&
-            p_class_get_fields && p_class_get_methods && p_field_get_name &&
-            p_field_get_offset && p_method_get_name && p_method_get_param_count) ? 0 : -1;
+    if (!p_domain_get || !p_domain_get_assemblies || !p_assembly_get_image ||
+        !p_image_get_name || !p_image_get_class_count || !p_image_get_class ||
+        !p_class_get_name || !p_class_get_fields || !p_class_get_methods ||
+        !p_field_get_name || !p_field_get_offset ||
+        !p_method_get_name || !p_method_get_param_count) {
+        if (missing.length > 0) {
+            ra_log_stage([NSString stringWithFormat:@"resolve: MISSING %@", missing]);
+        }
+        return -1;
+    }
+    return 0;
 }
 
 static BOOL ra_string_matches_any(NSString* s, NSArray* patterns) {
     if (!s || !patterns) return NO;
-    for (NSString* p in patterns) {
-        if ([s isEqualToString:p]) return YES;
-    }
+    for (NSString* p in patterns) if ([s isEqualToString:p]) return YES;
     return NO;
 }
 
 static BOOL ra_string_contains_any(NSString* s, NSArray* patterns) {
     if (!s || !patterns) return NO;
-    for (NSString* p in patterns) {
-        if ([s containsString:p]) return YES;
-    }
+    for (NSString* p in patterns) if ([s containsString:p]) return YES;
     return NO;
 }
 
@@ -194,6 +194,7 @@ static void* ra_method_pointer_raw(const Il2CppMethod* m) {
 // ============================================================
 static void ra_dump(void) {
     ra_log_stage(@"dump: starting");
+
     NSString* bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSMutableString* out = [NSMutableString stringWithCapacity:1 << 20];
 
@@ -209,127 +210,124 @@ static void ra_dump(void) {
     if (!domain) {
         ra_log_stage(@"dump: domain NULL");
         [out appendString:@"ERROR: il2cpp_domain_get returned NULL\n"];
-    } else {
-        size_t asmCount = 0;
-        const Il2CppAssembly** asms = p_domain_get_assemblies(domain, &asmCount);
-        [out appendFormat:@"assembly_count: %zu\n\n", asmCount];
+        ra_write(kOutName, out);
+        return;
+    }
 
-        if (!asms) {
-            ra_log_stage(@"dump: assemblies NULL");
-            [out appendString:@"ERROR: assembly list NULL\n"];
-        } else {
-            for (size_t i = 0; i < asmCount; i++) {
-                const Il2CppAssembly* asm_ = asms[i];
-                if (!asm_) continue;
-                const Il2CppImage* img = p_assembly_get_image(asm_);
-                if (!img) continue;
-                const char* an = p_image_get_name(img);
-                if (!an) continue;
-                NSString* asmName = [NSString stringWithUTF8String:an];
-                if (!ra_string_matches_any(asmName, kTargetAssemblies)) continue;
+    size_t asmCount = 0;
+    const Il2CppAssembly** asms = p_domain_get_assemblies(domain, &asmCount);
+    [out appendFormat:@"assembly_count: %zu\n\n", asmCount];
 
-                ra_log_stage([NSString stringWithFormat:@"dump: matched assembly %@", asmName]);
+    if (!asms) {
+        ra_log_stage(@"dump: assemblies NULL");
+        [out appendString:@"ERROR: assembly list NULL\n"];
+        ra_write(kOutName, out);
+        return;
+    }
 
-                size_t classCount = 0;
-                const Il2CppClass** classes = p_image_get_classes(img, &classCount);
-                if (!classes) continue;
+    for (size_t i = 0; i < asmCount; i++) {
+        const Il2CppAssembly* asm_ = asms[i];
+        if (!asm_) continue;
+        const Il2CppImage* img = p_assembly_get_image(asm_);
+        if (!img) continue;
+        const char* an = p_image_get_name(img);
+        if (!an) continue;
+        NSString* asmName = [NSString stringWithUTF8String:an];
+        if (!ra_string_matches_any(asmName, kTargetAssemblies)) continue;
 
-                NSMutableString* body = [NSMutableString stringWithCapacity:1 << 16];
-                size_t matched = 0;
+        ra_log_stage([NSString stringWithFormat:@"dump: matched assembly %@", asmName]);
 
-                for (size_t c = 0; c < classCount; c++) {
-                    const Il2CppClass* klass = classes[c];
-                    if (!klass) continue;
-                    const char* cn = p_class_get_name(klass);
-                    if (!cn) continue;
-                    NSString* clsName = [NSString stringWithUTF8String:cn];
-                    if (!ra_string_contains_any(clsName, kTargetClasses)) continue;
+        size_t classCount = p_image_get_class_count(img);
+        NSMutableString* body = [NSMutableString stringWithCapacity:1 << 16];
+        size_t matched = 0;
 
-                    matched++;
+        for (size_t c = 0; c < classCount; c++) {
+            const Il2CppClass* klass = p_image_get_class(img, c);
+            if (!klass) continue;
+            const char* cn = p_class_get_name(klass);
+            if (!cn) continue;
+            NSString* clsName = [NSString stringWithUTF8String:cn];
+            if (!ra_string_contains_any(clsName, kTargetClasses)) continue;
 
-                    const char* ns = p_class_get_namespace(klass);
-                    NSString* nsName = ns ? [NSString stringWithUTF8String:ns] : @"";
-                    const Il2CppClass* parent = p_class_get_parent(klass);
-                    NSString* parentName = @"";
-                    if (parent) {
-                        const char* pn  = p_class_get_name(parent);
-                        const char* pns = p_class_get_namespace(parent);
-                        parentName = [NSString stringWithFormat:@"%s%s%s",
-                                      pns ? pns : "",
-                                      (pns && *pns) ? "." : "",
-                                      pn ? pn : "?"];
-                    }
+            matched++;
 
-                    [body appendFormat:@"CLASS: %s%s%s\n",
-                     nsName.length ? [nsName UTF8String] : "",
-                     nsName.length ? "." : "",
-                     [clsName UTF8String]];
-
-                    if (parentName.length) {
-                        [body appendFormat:@"  parent: %@\n", parentName];
-                    }
-
-                    [body appendString:@"  fields:\n"];
-                    void* fiter = NULL;
-                    const Il2CppField* fld = NULL;
-                    int fc = 0;
-                    while ((fld = p_class_get_fields(klass, &fiter)) != NULL) {
-                        const char* fn = p_field_get_name(fld);
-                        size_t off = p_field_get_offset(fld);
-                        const char* tn = "?";
-                        if (p_field_get_type && p_type_get_name) {
-                            const Il2CppType* ft = p_field_get_type(fld);
-                            if (ft) {
-                                const char* t = p_type_get_name(ft);
-                                if (t) tn = t;
-                            }
-                        }
-                        [body appendFormat:@"    +0x%04zX  %s  %s\n",
-                         off, tn, fn ? fn : "?"];
-                        fc++;
-                        if (fc > 4096) break;
-                    }
-                    if (fc == 0) [body appendString:@"    (none)\n"];
-
-                    [body appendString:@"  methods:\n"];
-                    void* miter = NULL;
-                    const Il2CppMethod* m = NULL;
-                    int mc = 0;
-                    while ((m = p_class_get_methods(klass, &miter)) != NULL) {
-                        const char* mn = p_method_get_name(m);
-                        uint32_t pc = p_method_get_param_count(m);
-                        void* mp = ra_method_pointer_raw(m);
-                        uintptr_t mpAddr = mp ? ra_strip_pac(mp) : 0;
-
-                        if (mpAddr && g_moduleBase) {
-                            uintptr_t baseAddr = (uintptr_t)g_moduleBase;
-                            if (mpAddr >= baseAddr) {
-                                [body appendFormat:@"    M %s (%u) @ 0x%lx (rva 0x%lx)\n",
-                                 mn ? mn : "?", pc,
-                                 (unsigned long)mpAddr,
-                                 (unsigned long)(mpAddr - baseAddr)];
-                            } else {
-                                [body appendFormat:@"    M %s (%u) @ 0x%lx\n",
-                                 mn ? mn : "?", pc, (unsigned long)mpAddr];
-                            }
-                        } else {
-                            [body appendFormat:@"    M %s (%u)\n", mn ? mn : "?", pc];
-                        }
-                        mc++;
-                        if (mc > 8192) break;
-                    }
-                    if (mc == 0) [body appendString:@"    (none)\n"];
-                    [body appendString:@"\n"];
-                }
-
-                [out appendFormat:@"=========================================\n"];
-                [out appendFormat:@"ASSEMBLY: %@ (classes: %zu, matched: %zu)\n",
-                 asmName, classCount, matched];
-                [out appendFormat:@"=========================================\n\n"];
-                [out appendString:body];
-                [out appendString:@"\n"];
+            const char* ns = p_class_get_namespace(klass);
+            NSString* nsName = ns ? [NSString stringWithUTF8String:ns] : @"";
+            const Il2CppClass* parent = p_class_get_parent(klass);
+            NSString* parentName = @"";
+            if (parent) {
+                const char* pn  = p_class_get_name(parent);
+                const char* pns = p_class_get_namespace(parent);
+                parentName = [NSString stringWithFormat:@"%s%s%s",
+                              pns ? pns : "",
+                              (pns && *pns) ? "." : "",
+                              pn ? pn : "?"];
             }
+
+            [body appendFormat:@"CLASS: %s%s%s\n",
+             nsName.length ? [nsName UTF8String] : "",
+             nsName.length ? "." : "",
+             [clsName UTF8String]];
+
+            if (parentName.length) {
+                [body appendFormat:@"  parent: %@\n", parentName];
+            }
+
+            [body appendString:@"  fields:\n"];
+            void* fiter = NULL;
+            const Il2CppField* fld = NULL;
+            int fc = 0;
+            while ((fld = p_class_get_fields(klass, &fiter)) != NULL) {
+                const char* fn = p_field_get_name(fld);
+                size_t off = p_field_get_offset(fld);
+                const char* tn = "?";
+                if (p_field_get_type && p_type_get_name) {
+                    const Il2CppType* ft = p_field_get_type(fld);
+                    if (ft) {
+                        const char* t = p_type_get_name(ft);
+                        if (t) tn = t;
+                    }
+                }
+                [body appendFormat:@"    +0x%04zX  %s  %s\n",
+                 off, tn, fn ? fn : "?"];
+                fc++;
+                if (fc > 4096) break;
+            }
+            if (fc == 0) [body appendString:@"    (none)\n"];
+
+            [body appendString:@"  methods:\n"];
+            void* miter = NULL;
+            const Il2CppMethod* m = NULL;
+            int mc = 0;
+            while ((m = p_class_get_methods(klass, &miter)) != NULL) {
+                const char* mn = p_method_get_name(m);
+                uint32_t pc = p_method_get_param_count(m);
+                void* mp = ra_method_pointer_raw(m);
+                uintptr_t mpAddr = mp ? ra_strip_pac(mp) : 0;
+                if (mpAddr && g_moduleBase && mpAddr >= (uintptr_t)g_moduleBase) {
+                    [body appendFormat:@"    M %s (%u) @ 0x%lx (rva 0x%lx)\n",
+                     mn ? mn : "?", pc,
+                     (unsigned long)mpAddr,
+                     (unsigned long)(mpAddr - (uintptr_t)g_moduleBase)];
+                } else if (mpAddr) {
+                    [body appendFormat:@"    M %s (%u) @ 0x%lx\n",
+                     mn ? mn : "?", pc, (unsigned long)mpAddr];
+                } else {
+                    [body appendFormat:@"    M %s (%u)\n", mn ? mn : "?", pc];
+                }
+                mc++;
+                if (mc > 8192) break;
+            }
+            if (mc == 0) [body appendString:@"    (none)\n"];
+            [body appendString:@"\n"];
         }
+
+        [out appendFormat:@"=========================================\n"];
+        [out appendFormat:@"ASSEMBLY: %@ (classes: %zu, matched: %zu)\n",
+         asmName, classCount, matched];
+        [out appendFormat:@"=========================================\n\n"];
+        [out appendString:body];
+        [out appendString:@"\n"];
     }
 
     ra_write(kOutName, out);
@@ -341,7 +339,9 @@ static void ra_dump(void) {
 // ============================================================
 // poll loop
 // ============================================================
-static void ra_poll(NSTimeInterval start) {
+static void ra_poll(NSTimeInterval start, BOOL firstTick) {
+    if (firstTick) ra_log_stage(@"poll: first tick");
+
     if (ra_resolve_symbols() == 0) {
         Il2CppDomain* d = (Il2CppDomain*)p_domain_get();
         if (d) {
@@ -365,20 +365,19 @@ static void ra_poll(NSTimeInterval start) {
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kPollInterval * NSEC_PER_SEC)),
         dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-            ra_poll(start);
+            ra_poll(start, NO);
         });
 }
 
 // ============================================================
-// entry — heartbeat fires immediately
+// entry
 // ============================================================
 __attribute__((constructor))
 static void ra_entry(void) {
     static dispatch_once_t onceT;
     dispatch_once(&onceT, ^{
-        // --- heartbeat FIRST, before anything else ---
         ra_write(kHeartbeat, [NSString stringWithFormat:
-            @"=== RavenRecon heartbeat ===\n"
+            @"=== RavenRecon heartbeat v3.2 ===\n"
             @"loaded at: %@\n"
             @"bundle: %@\n"
             @"docs dir: %@\n",
@@ -404,16 +403,13 @@ static void ra_entry(void) {
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
             dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-                ra_poll(t0);
+                ra_poll(t0, YES);
             });
     });
 }
 """)
 
 
-# ════════════════════════════════════════════════════════════════
-# Makefile
-# ════════════════════════════════════════════════════════════════
 w("Makefile", r"""
 ARCHS = arm64 arm64e
 TARGET = iphone:clang:latest:14.0
@@ -431,21 +427,15 @@ include $(THEOS_MAKE_PATH)/tweak.mk
 """)
 
 
-# ════════════════════════════════════════════════════════════════
-# filter plist
-# ════════════════════════════════════════════════════════════════
 w("RavenRecon.plist", r"""
 { Filter = { Bundles = ( "com.AlfaBravo.CombatMaster" ); }; }
 """)
 
 
-# ════════════════════════════════════════════════════════════════
-# deb control
-# ════════════════════════════════════════════════════════════════
 w("control", r"""
 Package: com.mahi.ravenrecon
 Name: RavenRecon
-Version: 1.1.1
+Version: 1.1.2
 Architecture: iphoneos-arm64
 Description: IL2CPP class dumper — container-only output
 Maintainer: mahi
@@ -455,4 +445,4 @@ Depends: firmware (>= 14.0)
 """)
 
 
-print("done - RavenRecon v3.1 sources generated (heartbeat enabled)")
+print("done - RavenRecon v3.2 sources generated")
