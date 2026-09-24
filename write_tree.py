@@ -16,8 +16,7 @@ def w(path, content):
 
 
 w("Tweak.mm", r"""
-// RavenRecon v3.2 — filtered dumper, singular class API (v2-compatible),
-// symbol-resolution logging.
+// RavenRecon v3.3 — no assembly filter, class-name only. Scans all 163 asm.
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
@@ -31,8 +30,9 @@ w("Tweak.mm", r"""
 
 static NSString* const kOutName   = @"recon_dump.txt";
 static NSString* const kHeartbeat = @"recon_alive.txt";
-static NSString* const kMagic     = @"=== RAVEN RECON DUMP v3.2 ===";
+static NSString* const kMagic     = @"=== RAVEN RECON DUMP v3.3 ===";
 
+// nil = scan every assembly. class filter still applies.
 static NSArray* kTargetAssemblies = nil;
 static NSArray* kTargetClasses = nil;
 
@@ -70,9 +70,6 @@ static void ra_log_stage(NSString* stage) {
     NSLog(@"[RavenRecon] %@", stage);
 }
 
-// ============================================================
-// il2cpp types
-// ============================================================
 typedef struct Il2CppDomain   Il2CppDomain;
 typedef struct Il2CppAssembly Il2CppAssembly;
 typedef struct Il2CppImage    Il2CppImage;
@@ -152,7 +149,6 @@ static int ra_resolve_symbols(void) {
     RZ(h, "il2cpp_type_get_name",           p_type_get_name);
     RZ(h, "il2cpp_method_get_name",         p_method_get_name);
     RZ(h, "il2cpp_method_get_param_count",  p_method_get_param_count);
-    // optional
     p_method_get_pointer = (__typeof__(p_method_get_pointer))
         dlsym(h, "il2cpp_method_get_method_pointer");
 
@@ -170,7 +166,8 @@ static int ra_resolve_symbols(void) {
 }
 
 static BOOL ra_string_matches_any(NSString* s, NSArray* patterns) {
-    if (!s || !patterns) return NO;
+    if (!patterns) return YES;             // nil = match all
+    if (!s) return NO;
     for (NSString* p in patterns) if ([s isEqualToString:p]) return YES;
     return NO;
 }
@@ -188,9 +185,6 @@ static void* ra_method_pointer_raw(const Il2CppMethod* m) {
     return raw[0];
 }
 
-// ============================================================
-// dumper
-// ============================================================
 static void ra_dump(void) {
     ra_log_stage(@"dump: starting");
 
@@ -201,8 +195,8 @@ static void ra_dump(void) {
     [out appendFormat:@"date: %@\n", [NSDate date]];
     [out appendFormat:@"bundle: %@\n", bundle];
     [out appendFormat:@"module_base: %p\n", g_moduleBase];
-    [out appendFormat:@"module_slide: 0x%lX\n", (unsigned long)g_moduleSlide];
-    [out appendFormat:@"filter.assemblies: %@\n", [kTargetAssemblies componentsJoinedByString:@","]];
+    [out appendFormat:@"filter.assemblies: %@\n",
+        kTargetAssemblies ? [kTargetAssemblies componentsJoinedByString:@","] : @"(all)"];
     [out appendFormat:@"filter.classes: %@\n", [kTargetClasses componentsJoinedByString:@","]];
 
     Il2CppDomain* domain = (Il2CppDomain*)p_domain_get();
@@ -224,6 +218,11 @@ static void ra_dump(void) {
         return;
     }
 
+    size_t asmScanned = 0;
+    size_t asmMatched = 0;
+    size_t totalClasses = 0;
+    size_t totalMatched = 0;
+
     for (size_t i = 0; i < asmCount; i++) {
         const Il2CppAssembly* asm_ = asms[i];
         if (!asm_) continue;
@@ -231,14 +230,16 @@ static void ra_dump(void) {
         if (!img) continue;
         const char* an = p_image_get_name(img);
         if (!an) continue;
-        NSString* asmName = [NSString stringWithUTF8String:an];
-        if (!ra_string_matches_any(asmName, kTargetAssemblies)) continue;
 
-        ra_log_stage([NSString stringWithFormat:@"dump: matched assembly %@", asmName]);
+        asmScanned++;
+        NSString* asmName = [NSString stringWithUTF8String:an];
+
+        // nil assembly filter → accept every assembly
+        if (kTargetAssemblies && !ra_string_matches_any(asmName, kTargetAssemblies)) continue;
 
         size_t classCount = p_image_get_class_count(img);
         NSMutableString* body = [NSMutableString stringWithCapacity:1 << 16];
-        size_t matched = 0;
+        size_t matchedInAsm = 0;
 
         for (size_t c = 0; c < classCount; c++) {
             const Il2CppClass* klass = p_image_get_class(img, c);
@@ -248,7 +249,8 @@ static void ra_dump(void) {
             NSString* clsName = [NSString stringWithUTF8String:cn];
             if (!ra_string_contains_any(clsName, kTargetClasses)) continue;
 
-            matched++;
+            matchedInAsm++;
+            totalMatched++;
 
             const char* ns = p_class_get_namespace(klass);
             NSString* nsName = ns ? [NSString stringWithUTF8String:ns] : @"";
@@ -267,10 +269,10 @@ static void ra_dump(void) {
              nsName.length ? [nsName UTF8String] : "",
              nsName.length ? "." : "",
              [clsName UTF8String]];
-
             if (parentName.length) {
                 [body appendFormat:@"  parent: %@\n", parentName];
             }
+            [body appendFormat:@"  assembly: %@\n", asmName];
 
             [body appendString:@"  fields:\n"];
             void* fiter = NULL;
@@ -321,23 +323,30 @@ static void ra_dump(void) {
             [body appendString:@"\n"];
         }
 
-        [out appendFormat:@"=========================================\n"];
-        [out appendFormat:@"ASSEMBLY: %@ (classes: %zu, matched: %zu)\n",
-         asmName, classCount, matched];
-        [out appendFormat:@"=========================================\n\n"];
-        [out appendString:body];
-        [out appendString:@"\n"];
+        if (matchedInAsm > 0) {
+            asmMatched++;
+            [out appendFormat:@"=========================================\n"];
+            [out appendFormat:@"ASSEMBLY: %@ (classes: %zu, matched: %zu)\n",
+             asmName, classCount, matchedInAsm];
+            [out appendFormat:@"=========================================\n\n"];
+            [out appendString:body];
+            [out appendString:@"\n"];
+            ra_log_stage([NSString stringWithFormat:
+                @"dump: asm %@ matched %zu classes", asmName, matchedInAsm]);
+        }
+        totalClasses += classCount;
     }
 
+    [out appendFormat:@"\n// scanned %zu asm, %zu classes, %zu matched\n",
+        asmScanned, totalClasses, totalMatched];
+
     ra_write(kOutName, out);
-    ra_log_stage([NSString stringWithFormat:@"dump: wrote %lu bytes to %@",
-                  (unsigned long)[out lengthOfBytesUsingEncoding:NSUTF8StringEncoding],
-                  kOutName]);
+    ra_log_stage([NSString stringWithFormat:
+        @"dump: done. scanned=%zu matched=%zu wrote=%lu bytes",
+        asmScanned, totalMatched,
+        (unsigned long)[out lengthOfBytesUsingEncoding:NSUTF8StringEncoding]]);
 }
 
-// ============================================================
-// poll loop
-// ============================================================
 static void ra_poll(NSTimeInterval start, BOOL firstTick) {
     if (firstTick) ra_log_stage(@"poll: first tick");
 
@@ -368,15 +377,12 @@ static void ra_poll(NSTimeInterval start, BOOL firstTick) {
         });
 }
 
-// ============================================================
-// entry
-// ============================================================
 __attribute__((constructor))
 static void ra_entry(void) {
     static dispatch_once_t onceT;
     dispatch_once(&onceT, ^{
         ra_write(kHeartbeat, [NSString stringWithFormat:
-            @"=== RavenRecon heartbeat v3.2 ===\n"
+            @"=== RavenRecon heartbeat v3.3 ===\n"
             @"loaded at: %@\n"
             @"bundle: %@\n"
             @"docs dir: %@\n",
@@ -386,16 +392,13 @@ static void ra_entry(void) {
 
         ra_log_stage(@"entry: constructor fired");
 
-        kTargetAssemblies = @[ @"Assembly-CSharp" ];
+        // scan every assembly
+        kTargetAssemblies = nil;
+
         kTargetClasses = @[
             @"PlayerRoot", @"PlayerHealth", @"PlayerMovement", @"CameraController",
             @"PlayerMobView", @"ActiveMobView", @"MapPlayer", @"PlayerState",
-            @"PlayerMetadata", @"PlayerCommand",
-            @"GameManager", @"Player", @"LocalPlayer", @"Weapon",
-            @"WeaponController", @"Gun", @"Projectile",
-            @"Hitbox", @"HitBox", @"Bone", @"Team", @"Faction",
-            @"Room", @"MatchManager", @"Health", @"Damageable",
-            @"NetworkController", @"Entity", @"Pawn", @"Character", @"Enemy"
+            @"PlayerMetadata", @"PlayerCommand"
         ];
 
         NSTimeInterval t0 = [[NSDate date] timeIntervalSince1970];
@@ -434,7 +437,7 @@ w("RavenRecon.plist", r"""
 w("control", r"""
 Package: com.mahi.ravenrecon
 Name: RavenRecon
-Version: 1.1.3
+Version: 1.1.4
 Architecture: iphoneos-arm64
 Description: IL2CPP class dumper — container-only output
 Maintainer: mahi
@@ -444,4 +447,4 @@ Depends: firmware (>= 14.0)
 """)
 
 
-print("done - RavenRecon v3.2 sources generated (RZ macro fixed)")
+print("done - RavenRecon v3.3 — no assembly filter")
