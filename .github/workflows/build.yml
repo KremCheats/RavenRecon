@@ -1,4 +1,4 @@
-name: Build Raven
+name: Build RavenRecon
 
 on:
   push:
@@ -12,66 +12,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create filter plist
-        run: |
-          cat > Raven.plist <<'EOF'
-          { Filter = { Bundles = ( "com.AlfaBravo.CombatMaster" ); }; }
-          EOF
-
-      - name: Patch dumper to filter output
-        run: |
-          python3 - <<'PYEOF'
-          import sys
-
-          TARGET = "write_tree.py"
-          try:
-              src = open(TARGET).read()
-          except FileNotFoundError:
-              print("[error] write_tree.py not found"); sys.exit(1)
-
-          # 1. add <cstring> include so strstr works
-          if "#include <cstring>" not in src:
-              src = src.replace(
-                  "#import <dlfcn.h>\n#import <objc/runtime.h>",
-                  "#import <dlfcn.h>\n#import <objc/runtime.h>\n#include <cstring>"
-              )
-              print("[fix] added <cstring>")
-
-          # 2. insert the filter inside dumpEverything's class loop
-          anchor = '''    if (!cname) continue;
-              dumped++;'''
-          filt = '''    if (!cname) continue;
-              {
-                  const char* ns = cns ? cns : "";
-                  bool keep = false;
-                  const char* pats[] = {
-                      "PlayerRoot","PlayerHealth","PlayerMovement",
-                      "PlayerMobView","MobView","CameraController",
-                      "ActiveMobView","LocalPlayer","MyPlayer","AllPlayers",
-                      "PlayerManager","BattlePlayer","MapPlayer",
-                      "PlayerState","PlayerCommand","PlayerMetadata",
-                      NULL
-                  };
-                  for (int k = 0; pats[k]; k++) {
-                      if (strstr(cname, pats[k]) || strstr(ns, pats[k])) { keep = true; break; }
-                  }
-                  if (!keep) continue;
-              }
-              dumped++;'''
-
-          if anchor in src:
-              src = src.replace(anchor, filt)
-              print("[fix] filter injected")
-          elif "strstr(cname, \"PlayerRoot\")" in src:
-              print("[skip] filter already present")
-          else:
-              print("[warn] anchor not found — dump will stay unfiltered")
-
-          open(TARGET, "w").write(src)
-          PYEOF
-
       - name: Regenerate
         run: python3 write_tree.py
+
+      - name: Create filter plist
+        run: |
+          cat > RavenRecon.plist <<'EOF'
+          { Filter = { Bundles = ( "com.AlfaBravo.CombatMaster" ); }; }
+          EOF
 
       - name: Cache Theos
         id: cache-theos
@@ -100,16 +48,43 @@ jobs:
           make clean
           make
 
-      - name: Verify
+      - name: Locate and verify
+        id: locate
         run: |
-          DYLIB=$(find .theos -name 'Raven.dylib' -type f | head -n1)
-          echo "dylib: $DYLIB"
+          DYLIB=$(find .theos -name 'RavenRecon.dylib' -type f | head -n1)
+          if [ -z "$DYLIB" ]; then
+            echo "FAIL: RavenRecon.dylib not found"
+            find .theos -name '*.dylib' -type f | head -20
+            exit 1
+          fi
+          echo "found: $DYLIB"
+          echo "dylib_path=$DYLIB" >> $GITHUB_OUTPUT
           ls -la "$DYLIB"
-          strings "$DYLIB" | grep -q "PlayerRoot" && echo "OK: filter strings present" || { echo "FAIL"; exit 1; }
+          lipo -info "$DYLIB" || true
 
-      - name: Upload
+          echo "--- checks ---"
+          if strings "$DYLIB" | grep -q "RAVEN RECON DUMP v3"; then
+            echo "OK: v3 magic string present"
+          else
+            echo "FAIL: v3 magic missing"
+            exit 1
+          fi
+          if strings "$DYLIB" | grep -q "Assembly-CSharp"; then
+            echo "OK: assembly filter present"
+          else
+            echo "FAIL: assembly filter missing"
+            exit 1
+          fi
+          if strings "$DYLIB" | grep -q "recon_dump.txt"; then
+            echo "OK: output filename present"
+          else
+            echo "FAIL: output filename missing"
+            exit 1
+          fi
+
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
-          name: raven-dylib
-          path: ${{ github.workspace }}/.theos/obj/debug/Raven.dylib
+          name: ravenrecon-dylib
+          path: ${{ steps.locate.outputs.dylib_path }}
           if-no-files-found: error
